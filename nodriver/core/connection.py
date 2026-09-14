@@ -205,6 +205,15 @@ class Connection:
         self._mapper: dict[int, asyncio.Future] = {}
         self._tx_by_id: dict[int, Transaction] = {}
         self._listener_task: asyncio.Task | None = None
+        # Serializes the socket-state check, websockets.connect(), and
+        # listener-task creation in aopen() into one atomic critical
+        # section. Without this, two coroutines racing to attach() the
+        # same Connection can both observe "no socket yet", each open
+        # their own websocket, and each spawn a listener task; both
+        # listener tasks then read whichever socket aopen() assigned
+        # last, producing two concurrent recv() calls on one connection
+        # ("cannot call get() concurrently" from websockets' Assembler).
+        self._open_lock = asyncio.Lock()
 
     #
     # @classmethod
@@ -228,13 +237,14 @@ class Connection:
         if not self.websocket_url:
             raise RuntimeError("having no parent and no websocket url")
 
-        if not self.socket or bool(self.socket.close_code):
-            self.socket = await websockets.connect(
-                self.websocket_url,
-                ping_timeout=PING_TIMEOUT,
-                max_size=MAX_SIZE,
-            )
-            self._listener_task = asyncio.create_task(self._listener())
+        async with self._open_lock:
+            if not self.socket or bool(self.socket.close_code):
+                self.socket = await websockets.connect(
+                    self.websocket_url,
+                    ping_timeout=PING_TIMEOUT,
+                    max_size=MAX_SIZE,
+                )
+                self._listener_task = asyncio.create_task(self._listener())
 
     async def aclose(self):
         """ """
