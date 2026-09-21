@@ -467,8 +467,31 @@ class Connection:
             raise RuntimeError("Listener started without an active socket connection.")
 
         while True:
+            # ws.recv() itself is split from message processing below: a
+            # recv()-side failure means the transport is in an unknown,
+            # likely broken state (e.g. websockets' Assembler left with a
+            # stale get_waiter after a prior forced shutdown, which then
+            # raises "AssertionError: cannot call get() concurrently" on
+            # every subsequent call) -- retrying it immediately would spin
+            # at zero delay forever, flooding the log. A failure while
+            # processing one already-received message is not a broken
+            # transport, so that case still just logs and moves on to the
+            # next recv(), which is naturally rate-limited by incoming
+            # traffic and cannot spin.
             try:
                 raw = await ws.recv()
+            except websockets.exceptions.ConnectionClosed:
+                self._fail_pending_futures(ConnectionError("Connection closed"))
+                break
+            except asyncio.CancelledError as e:
+                self._fail_pending_futures(e)
+                break
+            except Exception as e:
+                logger.error(f"background listener error: {e}", exc_info=True)
+                self._fail_pending_futures(e)
+                break
+
+            try:
                 if not raw:
                     continue
                 message = json.loads(raw)
@@ -485,15 +508,11 @@ class Connection:
                 elif "method" in message:
                     # Unsolicited events are out-of-band unless an explicit tx id is provided.
                     await self.process_event(message, None)
-
-            except websockets.exceptions.ConnectionClosed:
-                self._fail_pending_futures(ConnectionError("Connection closed"))
-                break
-            except asyncio.CancelledError as e:
-                self._fail_pending_futures(e)
-                break
             except Exception as e:
-                logger.error(f"background listener error: {e}", exc_info=True)
+                logger.error(
+                    f"background listener error processing message: {e}",
+                    exc_info=True,
+                )
 
     async def process_event(self, message: dict, tx_id: int | None = None) -> None:
         """ """
